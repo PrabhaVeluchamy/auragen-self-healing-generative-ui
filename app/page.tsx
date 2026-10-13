@@ -22,7 +22,7 @@ type AdaptationAction =
   | "SHOW_GUIDANCE"
   | "SIMPLIFY_FORM"
   | "HIGHLIGHT_FIELD"
-  | "HIDE_ADVANCED_FIELDS";
+  | "HIDE_FIELD";
 
 type ChangeType =
   | "HIDE_FIELD"
@@ -67,6 +67,13 @@ const DEFAULT_VISIBILITY: FieldVisibility = {
   taxId: true,
   investmentAmount: true,
   taxCategory: true,
+};
+
+const FIELD_GUIDANCE: Record<FieldName, string> = {
+  annualIncome: "Please enter your annual income using the details available in your records.",
+  taxId: "Your Tax Identification Number is a 9-digit number. You can find it in your office account.",
+  investmentAmount: "Please enter the amount you plan to invest.",
+  taxCategory: "Please select the tax category that best matches your situation.",
 };
 
 // ============================================================
@@ -224,30 +231,54 @@ export default function Home() {
   const handleFieldFocus = (
     field: FieldName
   ) => {
+    // Update the active field and guidance immediately. Do not wait
+    // for Gemini or a WebSocket response to show field-specific help.
     setActiveField(field);
+    setGuidanceMessage(FIELD_GUIDANCE[field]);
+    setHighlightedField(field);
+    setGenAIError("");
 
     setFieldInteractions((previous) => ({
       ...previous,
-      [field]:
-        (previous[field] || 0) + 1,
+      [field]: (previous[field] || 0) + 1,
     }));
 
     setIsHesitating(true);
-
     setHesitationSeconds(0);
 
     if (hesitationTimer.current) {
-      clearInterval(
-        hesitationTimer.current
-      );
+      clearInterval(hesitationTimer.current);
     }
 
-    hesitationTimer.current =
-      setInterval(() => {
-        setHesitationSeconds(
-          (previous) => previous + 1
-        );
-      }, 1000);
+    hesitationTimer.current = setInterval(() => {
+      setHesitationSeconds((previous) => previous + 1);
+    }, 1000);
+
+    // Send activeField immediately so the backend does not have to
+    // wait for the throttled telemetry effect.
+    const socket = socketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      const payload = {
+        type: "telemetry",
+        activeField: field,
+        movementCount,
+        totalMovementDistance,
+        frictionScore,
+        cognitiveLoad,
+        hesitationSeconds: 0,
+        isHesitating: true,
+        fieldInteractions: {
+          ...fieldInteractions,
+          [field]: (fieldInteractions[field] || 0) + 1,
+        },
+        timestamp: Date.now(),
+      };
+
+      socket.send(JSON.stringify(payload));
+      console.log("[AuraGen] Active field telemetry sent:", field);
+    } else {
+      console.warn("[AuraGen] WebSocket is not connected; field telemetry will be sent after connection.");
+    }
   };
 
   const handleFieldBlur = () => {
@@ -679,8 +710,16 @@ export default function Home() {
             "Self-healing adaptation applied"
           );
 
+          const responseField =
+            (plan.targetField || data.activeField) as FieldName | undefined;
+
+          if (responseField && FIELD_GUIDANCE[responseField]) {
+            setActiveField(responseField);
+          }
+
           setGuidanceMessage(
-            plan.guidance ||
+            (responseField && FIELD_GUIDANCE[responseField]) ||
+              plan.guidance ||
               plan.reason ||
               ""
           );
@@ -823,8 +862,10 @@ export default function Home() {
           plan.action ===
           "SHOW_GUIDANCE"
         ) {
+          const field = plan.targetField as FieldName | undefined;
           setGuidanceMessage(
-            plan.guidance ||
+            (field && FIELD_GUIDANCE[field]) ||
+              plan.guidance ||
               plan.reason ||
               "Please continue carefully."
           );
@@ -859,8 +900,10 @@ export default function Home() {
             );
           }
 
+          const field = plan.targetField as FieldName | undefined;
           setGuidanceMessage(
-            plan.guidance ||
+            (field && FIELD_GUIDANCE[field]) ||
+              plan.guidance ||
               "Please review the highlighted field."
           );
 
@@ -913,8 +956,10 @@ export default function Home() {
             }
           );
 
+          const field = plan.targetField as FieldName | undefined;
           setGuidanceMessage(
-            plan.guidance ||
+            (field && FIELD_GUIDANCE[field]) ||
+              plan.guidance ||
               "The form has been simplified to reduce interaction difficulty."
           );
 
@@ -935,7 +980,7 @@ export default function Home() {
 
         if (
           plan.action ===
-          "HIDE_ADVANCED_FIELDS"
+          "HIDE_FIELD"
         ) {
           setShowAdvancedFields(
             false

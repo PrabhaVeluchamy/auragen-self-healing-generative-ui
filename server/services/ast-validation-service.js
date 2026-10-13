@@ -38,7 +38,7 @@ const ALLOWED_ACTIONS = new Set([
   "SHOW_GUIDANCE",
   "SIMPLIFY_FORM",
   "HIGHLIGHT_FIELD",
-  "HIDE_ADVANCED_FIELDS",
+  "HIDE_FIELD",
 ]);
 
 // ============================================================

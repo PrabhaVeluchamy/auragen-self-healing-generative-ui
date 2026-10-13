@@ -103,3 +103,23 @@ The current project uses a rule-based decision service and prompt generation.
 The actual external LLM call is intentionally not included yet. The prompt-service produces a structured prompt that can later be passed to the selected LLM provider.
 
 Do not execute generated JavaScript/HTML directly. Future generated UI should pass through schema validation, AST validation where applicable, allow-listed components/actions, and build/runtime testing before being applied.
+
+AuraGen field-specific guidance fix
+
+1. Replace app/page.tsx with page.tsx from this package.
+   - Existing dashboard layout/styles are preserved.
+   - Field focus immediately displays the correct guidance.
+   - Active field telemetry is sent immediately over the existing WebSocket.
+   - Adaptation responses prefer guidance for the plan's target field.
+
+2. Replace server/services/genai-service.js with genai-service.js from this package.
+   - Preserves generateUIAdaptation(genAIContext, prompt) signature.
+   - Uses context.interaction.activeField when available.
+   - Adds a 5-second Gemini timeout and deterministic fallback.
+   - Does not remove AST or final-plan validation; keep those in the existing caller pipeline.
+
+3. IMPORTANT: Keep the existing websocket-server.js and its AST/final-plan validation pipeline. The current integration must call generateUIAdaptation(genAIContext, prompt), validate the returned plan, and only then send the approved plan in an adaptation_trigger message with a `plan` property. Do not bypass validation.
+
+4. Restart the backend and frontend after replacing the files.
+
+Field guidance is selected from the active field telemetry. If the active field is absent or invalid, the backend does not silently default to annual-income guidance.

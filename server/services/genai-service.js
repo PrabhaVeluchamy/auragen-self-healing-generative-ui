@@ -3,193 +3,162 @@ require("dotenv").config();
 const { GoogleGenAI } = require("@google/genai");
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GEMINI_TIMEOUT_MS = 5000;
+
+const FIELD_GUIDANCE = {
+  annualIncome:
+    "Please enter your annual income using the details available in your records.",
+  taxId:
+    "Your Tax Identification Number is a 9-digit number. You can find it in your office account.",
+  investmentAmount:
+    "Please enter the amount you plan to invest.",
+  taxCategory:
+    "Please select the tax category that best matches your situation.",
+};
+
+const VALID_FIELDS = new Set(Object.keys(FIELD_GUIDANCE));
 
 let ai = null;
-
 if (GEMINI_API_KEY) {
-  ai = new GoogleGenAI({
-    apiKey: GEMINI_API_KEY,
-  });
+  ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 }
 
-/**
- * Generate an adaptation plan using Gemini.
- *
- * If Gemini is unavailable (for example, 429 quota exceeded),
- * AuraGen uses a deterministic safe fallback.
- */
-async function generateUIAdaptation(genAIContext, prompt) {
-  console.log("\n🤖 GENAI ADAPTATION");
+function withTimeout(promise, timeoutMs = GEMINI_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Gemini timed out after ${timeoutMs} ms`)),
+      timeoutMs
+    );
+  });
 
-  // --------------------------------------------------
-  // Try Gemini
-  // --------------------------------------------------
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function getActiveField(context = {}, plan = {}) {
+  // Context produced by buildGenAIContext uses interaction.activeField.
+  const candidate =
+    context?.interaction?.activeField ??
+    context?.telemetry?.interaction?.activeField ??
+    context?.activeField ??
+    plan?.targetField;
+
+  return VALID_FIELDS.has(candidate) ? candidate : null;
+}
+
+function applyFieldSpecificGuidance(plan, context) {
+  if (!plan || typeof plan !== "object" || plan.action === "NO_ACTION") {
+    return plan;
+  }
+
+  const field = getActiveField(context, plan);
+  if (!field) {
+    // Do not incorrectly default to annualIncome if telemetry is missing.
+    return plan;
+  }
+
+  return {
+    ...plan,
+    targetField: field,
+    guidance: FIELD_GUIDANCE[field],
+  };
+}
+
+async function generateUIAdaptation(genAIContext, prompt) {
+  const startedAt = Date.now();
+  console.log("\n🤖 GENAI ADAPTATION");
 
   if (ai) {
     try {
-      console.log("🧠 Calling Gemini...");
-      console.log("Model:", GEMINI_MODEL);
+      console.log("🧠 Calling Gemini; model:", GEMINI_MODEL);
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: prompt,
+          config: {
+            systemInstruction:
+              "You are AuraGen's safe Generative UI planning component. " +
+              "Return only valid JSON. Never generate executable JavaScript, HTML, or arbitrary code. " +
+              "Use only the allowed actions, change types, and fields specified in the prompt.",
+            temperature: 0.1,
+            maxOutputTokens: 300,
+            responseMimeType: "application/json",
+          },
+        }),
+        GEMINI_TIMEOUT_MS
+      );
 
-      const response = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: prompt,
-        config: {
-          systemInstruction:
-            "You are AuraGen's safe Generative UI planning component. " +
-            "Return only valid JSON. " +
-            "Never generate executable JavaScript, HTML, or arbitrary code.",
-          temperature: 0.2,
-        },
-      });
-
+      console.log(`[PERF] Gemini: ${Date.now() - startedAt} ms`);
       const rawText = response.text?.trim();
-
-      if (!rawText) {
-        throw new Error("Gemini returned an empty response.");
-      }
-
-      console.log("✅ Gemini response received");
+      if (!rawText) throw new Error("Gemini returned an empty response.");
 
       let plan;
-
       try {
         plan = JSON.parse(rawText);
       } catch {
         throw new Error("Gemini returned invalid JSON.");
       }
 
+      // Keep AST and final plan validation in the existing caller pipeline.
+      plan = applyFieldSpecificGuidance(plan, genAIContext);
+
       return {
         provider: "gemini",
         model: GEMINI_MODEL,
         plan,
-        rawText,
+        rawText: JSON.stringify(plan),
       };
     } catch (error) {
-      console.log("\n⚠️ GEMINI UNAVAILABLE");
-      console.log(
-        "Status:",
-        error?.status || error?.code || "UNKNOWN"
+      console.error(
+        `[PERF] Gemini unavailable after ${Date.now() - startedAt} ms:`,
+        error?.message || error
       );
-
-      if (error?.status === 429) {
-        console.log(
-          "Reason: Gemini API quota exceeded."
-        );
-      } else {
-        console.log(
-          "Reason:",
-          error?.message || "Unknown Gemini error."
-        );
-      }
-
-      console.log("🔄 Switching to SAFE MOCK GENAI...");
+      console.log("🔄 Switching to deterministic safe fallback.");
     }
   } else {
-    console.log("⚠️ GEMINI_API_KEY not configured.");
-    console.log("🔄 Switching to SAFE MOCK GENAI...");
+    console.warn("GEMINI_API_KEY not configured; using safe fallback.");
   }
 
-  // --------------------------------------------------
-  // Safe fallback
-  // --------------------------------------------------
-
-  return generateMockAdaptation(genAIContext);
+  const fallback = generateMockAdaptation(genAIContext);
+  console.log(`[PERF] Fallback service: ${Date.now() - startedAt} ms`);
+  return fallback;
 }
 
-
-/**
- * Safe deterministic fallback.
- *
- * IMPORTANT:
- * This does NOT generate executable code.
- * It only returns predefined UI actions.
- */
-function generateMockAdaptation(context) {
-  const friction =
-    Number(context?.friction?.score) || 0;
-
-  const cognitiveLoad =
-    Number(context?.cognitiveLoad?.score) || 0;
-
-  const activeField =
-    context?.interaction?.activeField ||
-    "annualIncome";
-
-  console.log("\n🧪 MOCK GENAI");
-
-  console.log("Friction Score:", friction);
-  console.log("Cognitive Load:", cognitiveLoad);
-  console.log("Active Field:", activeField);
+function generateMockAdaptation(context = {}) {
+  const friction = Number(context?.friction?.score ?? context?.frictionScore ?? 0) || 0;
+  const cognitiveLoad = Number(context?.cognitiveLoad?.score ?? context?.cognitiveLoadScore ?? 0) || 0;
+  const activeField = getActiveField(context);
 
   let plan;
-
   if (friction >= 70 || cognitiveLoad >= 70) {
     plan = {
       action: "SIMPLIFY_FORM",
-
-      targetField: activeField,
-
-      reason:
-        "High interaction difficulty detected.",
-
-      changes: [
-        {
-          type: "HIDE_FIELD",
-          field: "investmentAmount",
-        },
-      ],
-
-      guidance:
-        "Complete the required information first. " +
-        "Advanced fields have been temporarily simplified.",
-
-      confidence: 0.90,
+      ...(activeField ? { targetField: activeField } : {}),
+      reason: "High interaction difficulty detected.",
+      changes: [{ type: "HIDE_FIELD", field: "investmentAmount" }],
+      guidance: activeField ? FIELD_GUIDANCE[activeField] : "The form has been simplified to reduce interaction difficulty.",
+      confidence: 0.9,
     };
-  } else if (
-    friction >= 40 ||
-    cognitiveLoad >= 40
-  ) {
+  } else if (friction >= 40 || cognitiveLoad >= 40) {
     plan = {
       action: "SHOW_GUIDANCE",
-
-      targetField: activeField,
-
-      reason:
-        "Moderate interaction difficulty detected.",
-
+      ...(activeField ? { targetField: activeField } : {}),
+      reason: "Moderate interaction difficulty detected.",
       changes: [],
-
-      guidance:
-        "Take a moment to complete the highlighted field.",
-
-      confidence: 0.80,
+      guidance: activeField ? FIELD_GUIDANCE[activeField] : "Please complete the field carefully.",
+      confidence: 0.8,
     };
   } else {
     plan = {
       action: "NO_ACTION",
-
-      targetField: activeField,
-
-      reason:
-        "Interaction difficulty is within the normal range.",
-
+      ...(activeField ? { targetField: activeField } : {}),
+      reason: "Interaction difficulty is within the normal range.",
       changes: [],
-
       guidance: "",
-
       confidence: 0.95,
     };
   }
-
-  console.log(
-    "🧠 Mock Adaptation Plan:"
-  );
-
-  console.log(
-    JSON.stringify(plan, null, 2)
-  );
 
   return {
     provider: "mock",
@@ -199,6 +168,4 @@ function generateMockAdaptation(context) {
   };
 }
 
-module.exports = {
-  generateUIAdaptation,
-};
+module.exports = { generateUIAdaptation };
